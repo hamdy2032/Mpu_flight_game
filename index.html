@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>ESP32 MPU6500 Flight Simulator</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, sans-serif; }
+    body { overflow: hidden; background: #1a1a2e; user-select: none; }
+    canvas { display: block; }
+
+    /* Top HUD Bar */
+    #top-hud {
+      position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 18px; background: rgba(20, 26, 38, 0.85);
+      padding: 10px 24px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.12);
+      color: #fff; text-align: center; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+      z-index: 10;
+    }
+    .hud-box { min-width: 65px; }
+    .hud-label { font-size: 10px; letter-spacing: 1px; color: #94a3b8; text-transform: uppercase; }
+    .hud-val { font-size: 20px; font-weight: 800; margin-top: 2px; }
+    #val-score { color: #facc15; }
+    #val-lives { color: #ef4444; letter-spacing: 2px; }
+
+    /* Proximity Warning */
+    #proximity-alert {
+      position: fixed; top: 95px; left: 50%; transform: translateX(-50%);
+      background: rgba(239, 68, 68, 0.9); color: #fff; font-weight: 800;
+      padding: 8px 26px; border-radius: 6px; letter-spacing: 2px;
+      box-shadow: 0 0 20px rgba(239, 68, 68, 0.8);
+      display: none; animation: blink 0.4s infinite alternate; z-index: 10;
+    }
+    @keyframes blink { from { opacity: 1; } to { opacity: 0.4; } }
+
+    /* Bottom Telemetry Bar */
+    #bottom-hud {
+      position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 22px; background: rgba(15, 23, 42, 0.85);
+      padding: 8px 22px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12);
+      color: #38bdf8; font-size: 12px; font-weight: 700; z-index: 10;
+    }
+    #bottom-hud span { color: #94a3b8; font-weight: 400; margin-right: 4px; }
+
+    /* Control Panel (Connect ESP32) */
+    #controls {
+      position: fixed; top: 18px; right: 18px; display: flex; gap: 8px; z-index: 20;
+    }
+    button {
+      background: #2563eb; color: #fff; border: none; padding: 10px 16px;
+      border-radius: 8px; font-weight: 700; cursor: pointer; transition: 0.2s;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    }
+    button:hover { background: #1d4ed8; }
+    #btn-calibrate { background: #0f766e; }
+    #btn-calibrate:hover { background: #115e59; }
+
+    /* Game Over / Win Overlay */
+    #overlay {
+      position: fixed; inset: 0; background: rgba(10, 15, 28, 0.85);
+      display: none; flex-direction: column; align-items: center; justify-content: center;
+      color: #fff; z-index: 30; text-align: center;
+    }
+    #overlay h1 { font-size: 42px; margin-bottom: 10px; color: #facc15; }
+    #overlay p { font-size: 18px; margin-bottom: 24px; color: #cbd5e1; }
+  </style>
+</head>
+<body>
+
+  <div id="top-hud">
+    <div class="hud-box"><div class="hud-label">SCORE</div><div class="hud-val" id="val-score">0</div></div>
+    <div class="hud-box"><div class="hud-label">TIME</div><div class="hud-val" id="val-time">0.0</div></div>
+    <div class="hud-box"><div class="hud-label">RINGS</div><div class="hud-val" id="val-rings">0/30</div></div>
+    <div class="hud-box"><div class="hud-label">COMBO</div><div class="hud-val" id="val-combo">x1</div></div>
+    <div class="hud-box"><div class="hud-label">LIVES</div><div class="hud-val" id="val-lives">♥♥♥</div></div>
+  </div>
+
+  <div id="proximity-alert">⚠ PROXIMITY ⚠</div>
+
+  <div id="controls">
+    <button id="btn-calibrate">Calibrate Center (C)</button>
+    <button id="btn-connect">Connect ESP32</button>
+  </div>
+
+  <div id="bottom-hud">
+    <div><span>AIRSPEED</span><b id="hud-spd">185 KTS</b></div>
+    <div><span>ALTITUDE</span><b id="hud-alt">450 FT</b></div>
+    <div><span>HEADING</span><b id="hud-hdg">360°</b></div>
+    <div><span>PITCH/ROLL</span><b id="hud-pr">0° / 0°</b></div>
+  </div>
+
+  <div id="overlay">
+    <h1 id="ov-title">MISSION COMPLETE</h1>
+    <p id="ov-msg">Final Score: 0</p>
+    <button onclick="resetGame()">Play Again</button>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script>
+    // --- 1. SCENE & LIGHTING SETUP ---
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xd99b78); // Warm sunset sky like the video
+    scene.fog = new THREE.FogExp2(0xd99b78, 0.0022);
+
+    const camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const hemiLight = new THREE.HemisphereLight(0xffeeb1, 0x334155, 1.1);
+    scene.add(hemiLight);
+    const dirLight = new THREE.DirectionalLight(0xffedd5, 0.9);
+    dirLight.position.set(100, 200, 100);
+    scene.add(dirLight);
+
+    // Distant Mountains / Pyramids Silhouette
+    const mtnMat = new THREE.MeshLambertMaterial({ color: 0xb87d62 });
+    for (let i = 0; i < 8; i++) {
+      const mtn = new THREE.Mesh(new THREE.ConeGeometry(160, 220, 4), mtnMat);
+      mtn.position.set((i - 4) * 210, 90, -750);
+      scene.add(mtn);
+    }
+
+    // --- 2. AIRPLANE MODEL (Red Body, White Wings, Nav Lights) ---
+    const plane = new THREE.Group();
+    const bodyMesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.45, 0.65, 4.2, 12),
+      new THREE.MeshPhongMaterial({ color: 0xdc2626 })
+    );
+    bodyMesh.rotation.x = Math.PI / 2;
+    plane.add(bodyMesh);
+
+    const wingMesh = new THREE.Mesh(
+      new THREE.BoxGeometry(7.5, 0.15, 1.1),
+      new THREE.MeshPhongMaterial({ color: 0xf8fafc })
+    );
+    wingMesh.position.set(0, 0.15, -0.3);
+    plane.add(wingMesh);
+
+    // Wingtip Lights (Left Red, Right Green)
+    const leftLight = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.2, 0.4), new THREE.MeshBasicMaterial({ color: 0xff2222 }));
+    leftLight.position.set(-3.75, 0.15, -0.3);
+    plane.add(leftLight);
+
+    const rightLight = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.2, 0.4), new THREE.MeshBasicMaterial({ color: 0x22ff66 }));
+    rightLight.position.set(3.75, 0.15, -0.3);
+    plane.add(rightLight);
+
+    // Tail
+    const tailH = new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.12, 0.6), new THREE.MeshPhongMaterial({ color: 0xf8fafc }));
+    tailH.position.set(0, 0.2, 1.8);
+    plane.add(tailH);
+    const tailV = new THREE.Mesh(new THREE.BoxGeometry(0.12, 1.1, 0.7), new THREE.MeshPhongMaterial({ color: 0xdc2626 }));
+    tailV.position.set(0, 0.6, 1.8);
+    plane.add(tailV);
+
+    plane.position.set(0, 35, 0);
+    scene.add(plane);
+
+    // --- 3. PROCEDURAL CITY & BUILDINGS ---
+    const buildings = [];
+    const buildingColors = [0xe2d8c3, 0xb55338, 0x8a7967, 0xc97a57, 0x5c5346];
+
+    // Road Ground
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(600, 4000),
+      new THREE.MeshLambertMaterial({ color: 0x1e293b })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.z = -1500;
+    scene.add(ground);
+
+    // Dashed Yellow Road Lines
+    const lineMat = new THREE.MeshBasicMaterial({ color: 0xfacc15 });
+    for (let z = 20; z > -3000; z -= 18) {
+      [-24, 0, 24].forEach(x => {
+        const dash = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 8), lineMat);
+        dash.rotation.x = -Math.PI / 2;
+        dash.position.set(x, 0.05, z);
+        scene.add(dash);
+      });
+    }
+
+    // Generate City Blocks
+    function createBuilding(x, z) {
+      const w = 14 + Math.random() * 8;
+      const d = 14 + Math.random() * 8;
+      const h = 35 + Math.random() * 95;
+      const color = buildingColors[Math.floor(Math.random() * buildingColors.length)];
+      const mat = new THREE.MeshLambertMaterial({ color });
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+      mesh.position.set(x, h / 2, z);
+      scene.add(mesh);
+
+      // Antenna spire on tall buildings
+      if (h > 85) {
+        const spire = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.15, 0.25, 12),
+          new THREE.MeshBasicMaterial({ color: 0x334155 })
+        );
+        spire.position.set(x, h + 6, z);
+        scene.add(spire);
+      }
+
+      buildings.push({ mesh, x, z, w, h, d });
+    }
+
+    for (let z = -80; z > -2800; z -= 36) {
+      [-72, -48, -12, 12, 48, 72].forEach(x => {
+        if (Math.random() > 0.15) createBuilding(x, z + (Math.random() * 6 - 3));
+      });
+    }
+
+    // --- 4. TARGET RINGS (30 RINGS) ---
+    const rings = [];
+    const totalRings = 30;
+    const ringGeo = new THREE.TorusGeometry(4.5, 0.35, 12, 32);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0x22c55e });
+
+    for (let i = 0; i < totalRings; i++) {
+      const ring = new THREE.Mesh(ringGeo, ringMat.clone());
+      const rx = (Math.floor(Math.random() * 5) - 2) * 24;
+      const ry = 25 + Math.random() * 45;
+      const rz = -120 - i * 85;
+      ring.position.set(rx, ry, rz);
+      ring.userData = { collected: false };
+      scene.add(ring);
+      rings.push(ring);
+    }
+
+    // --- 5. GAME STATE & INPUT (ESP32 SERIAL + KEYBOARD FALLBACK) ---
+    let score = 0, ringsCollected = 0, combo = 1, lives = 3;
+    let startTime = performance.now();
+    let isGameOver = false;
+    let invulnerableTimer = 0;
+
+    let rawPitch = 0, rawRoll = 0;
+    let offsetPitch = 0, offsetRoll = 0;
+    const keys = {};
+
+    window.addEventListener('keydown', e => {
+      keys[e.key.toLowerCase()] = true;
+      if (e.key.toLowerCase() === 'c') calibrateCenter();
+    });
+    window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+
+    function calibrateCenter() {
+      offsetPitch = rawPitch;
+      offsetRoll = rawRoll;
+    }
+    document.getElementById('btn-calibrate').onclick = calibrateCenter;
+
+    // WebSerial Connection
+    document.getElementById('btn-connect').onclick = async () => {
+      if (!('serial' in navigator)) {
+        alert('WebSerial is not supported in this browser. Please use Chrome or Edge.');
+        return;
+      }
+      try {
+        const port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        document.getElementById('btn-connect').innerText = 'ESP32 Connected ✓';
+        document.getElementById('btn-connect').style.background = '#16a34a';
+
+        const decoder = new TextDecoderStream();
+        port.readable.pipeTo(decoder.writable);
+        const reader = decoder.readable.getReader();
+        let buffer = '';
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += value;
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          for (const line of lines) {
+            try {
+              const data = JSON.parse(line.trim());
+              if (typeof data.p === 'number' && typeof data.r === 'number') {
+                rawPitch = data.p;
+                rawRoll = data.r;
+              }
+            } catch (_) {}
+          }
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    };
+
+    function resetGame() {
+      score = 0; ringsCollected = 0; combo = 1; lives = 3;
+      isGameOver = false;
+      startTime = performance.now();
+      plane.position.set(0, 40, 0);
+      plane.rotation.set(0, 0, 0);
+      rings.forEach(r => { r.visible = true; r.userData.collected = false; });
+      document.getElementById('overlay').style.display = 'none';
+      updateHUD(0, 0);
+    }
+
+    function updateHUD(p, r) {
+      document.getElementById('val-score').innerText = score;
+      document.getElementById('val-rings').innerText = `${ringsCollected}/${totalRings}`;
+      document.getElementById('val-combo').innerText = `x${combo}`;
+      document.getElementById('val-lives').innerText = '♥'.repeat(Math.max(0, lives));
+      document.getElementById('hud-alt').innerText = `${Math.round(plane.position.y * 12)} FT`;
+      document.getElementById('hud-pr').innerText = `${Math.round(p)}° / ${Math.round(r)}°`;
+    }
+
+    // --- 6. MAIN GAME LOOP ---
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      if (isGameOver) return;
+
+      const dt = clock.getDelta();
+      const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+      document.getElementById('val-time').innerText = elapsed;
+
+      // Calculate effective Pitch & Roll (Sensor or Arrow Keys)
+      let pitch = rawPitch - offsetPitch;
+      let roll = rawRoll - offsetRoll;
+
+      if (keys['arrowup'] || keys['w']) pitch = 20;
+      if (keys['arrowdown'] || keys['s']) pitch = -20;
+      if (keys['arrowleft'] || keys['a']) roll = -25;
+      if (keys['arrowright'] || keys['d']) roll = 25;
+
+      // Clamp angles
+      pitch = Math.max(-45, Math.min(45, pitch));
+      roll = Math.max(-60, Math.min(60, roll));
+
+      // Smooth Plane Rotation & Movement
+      const targetRotX = THREE.MathUtils.degToRad(pitch * 0.6);
+      const targetRotZ = THREE.MathUtils.degToRad(-roll * 0.8);
+      plane.rotation.x += (targetRotX - plane.rotation.x) * 0.12;
+      plane.rotation.z += (targetRotZ - plane.rotation.z) * 0.12;
+
+      const forwardSpeed = 58;
+      plane.position.z -= forwardSpeed * dt;
+      plane.position.x += (roll * 0.9) * dt;
+      plane.position.y += (pitch * 0.7) * dt;
+
+      // Keep inside flight corridor
+      plane.position.x = Math.max(-85, Math.min(85, plane.position.x));
+      plane.position.y = Math.max(4, Math.min(130, plane.position.y));
+
+      // Camera Chase Follow
+      camera.position.set(
+        plane.position.x * 0.85,
+        plane.position.y + 3.2,
+        plane.position.z + 11.5
+      );
+      camera.lookAt(plane.position.x, plane.position.y + 0.8, plane.position.z - 25);
+
+      // Ring Collection Check
+      rings.forEach(ring => {
+        ring.rotation.z += 1.5 * dt;
+        if (!ring.userData.collected && plane.position.distanceTo(ring.position) < 5.8) {
+          ring.userData.collected = true;
+          ring.visible = false;
+          ringsCollected++;
+          score += 100 * combo;
+          combo = Math.min(8, combo + 1);
+        }
+      });
+
+      // Building Proximity & Collision Check
+      if (invulnerableTimer > 0) invulnerableTimer -= dt;
+      let nearBuilding = false;
+
+      for (const b of buildings) {
+        if (Math.abs(b.z - plane.position.z) > 35) continue;
+        const dx = Math.abs(plane.position.x - b.x);
+        const dz = Math.abs(plane.position.z - b.z);
+
+        // Proximity warning zone
+        if (dx < b.w / 2 + 7 && dz < b.d / 2 + 7 && plane.position.y < b.h + 5) {
+          nearBuilding = true;
+        }
+
+        // Direct collision
+        if (dx < b.w / 2 + 2.2 && dz < b.d / 2 + 1.8 && plane.position.y < b.h) {
+          if (invulnerableTimer <= 0) {
+            lives--;
+            combo = 1;
+            invulnerableTimer = 2.0;
+            plane.position.y += 15; // Bounce up safely
+            if (lives <= 0) {
+              isGameOver = true;
+              document.getElementById('ov-title').innerText = 'CRASHED!';
+              document.getElementById('ov-msg').innerText = `Score: ${score} | Rings: ${ringsCollected}/${totalRings}`;
+              document.getElementById('overlay').style.display = 'flex';
+            }
+          }
+        }
+      }
+
+      document.getElementById('proximity-alert').style.display = nearBuilding ? 'block' : 'none';
+
+      // End of Course Check
+      if (plane.position.z < -2750) {
+        isGameOver = true;
+        document.getElementById('ov-title').innerText = 'FLIGHT COMPLETE!';
+        document.getElementById('ov-msg').innerText = `Final Score: ${score} | Rings: ${ringsCollected}/${totalRings}`;
+        document.getElementById('overlay').style.display = 'flex';
+      }
+
+      updateHUD(pitch, roll);
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    animate();
+  </script>
+</body>
+</html>
